@@ -1,11 +1,12 @@
 """
 Granola Notes Scanner
 
-Reads meeting notes from Google Drive documents.
-Documents are named like "CompanyName + Folloze Meeting Agendas"
-with date-based sections inside (e.g., "January 30, 2025").
+Reads meeting notes from Google Drive folder.
+Supports two filename formats:
+1. ISO datetime: "2026-01-26T08:00:00-06:00 - Attendee Names"
+2. Simple date: "YYYY-MM-DD_CompanyName_Topic.txt"
 
-Matches notes to calendar meetings by date and company name.
+Matches notes to calendar meetings by date and attendee names.
 """
 
 import json
@@ -36,136 +37,85 @@ def get_credentials() -> Credentials:
     return Credentials.from_authorized_user_file(str(token_path))
 
 
-def extract_doc_text(docs_service, doc_id: str) -> str:
-    """Extract plain text from a Google Doc."""
-    doc = docs_service.documents().get(documentId=doc_id).execute()
-    content = doc.get("body", {}).get("content", [])
-
-    text = ""
-    for elem in content:
-        if "paragraph" in elem:
-            for e in elem["paragraph"].get("elements", []):
-                if "textRun" in e:
-                    text += e["textRun"].get("content", "")
-
-    return text
-
-
-def parse_date_from_text(text: str) -> Optional[str]:
+def parse_granola_filename(filename: str) -> Optional[dict]:
     """
-    Try to parse a date from text like "January 30, 2025" or "Jan 30, 2025".
-    Returns YYYY-MM-DD format or None.
+    Parse a Granola note filename.
+
+    Supports formats:
+    1. "2026-01-26T08:00:00-06:00 - Trey Harnden and Christoffer Oxenius"
+    2. "YYYY-MM-DD_CompanyName_Topic.txt"
+
+    Returns: {date, attendees, company, topic} or None
     """
-    # Common date patterns
-    patterns = [
-        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})",
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})",
-    ]
+    # Remove file extension if present
+    if filename.endswith(".txt"):
+        filename = filename[:-4]
 
-    month_map = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4,
-        "jun": 6, "jul": 7, "aug": 8, "sep": 9,
-        "oct": 10, "nov": 11, "dec": 12,
-    }
+    # Try ISO datetime format: "2026-01-26T08:00:00-06:00 - Names"
+    iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})T[\d:+-]+ - (.+)$", filename)
+    if iso_match:
+        date_str = iso_match.group(1)
+        attendees_str = iso_match.group(2)
+        # Parse attendee names (split by "and" or ",")
+        attendees = re.split(r"\s+and\s+|,\s*", attendees_str)
+        attendees = [a.strip() for a in attendees if a.strip()]
+        return {
+            "date": date_str,
+            "attendees": attendees,
+            "company": "",
+            "topic": "",
+        }
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            month_str = match.group(1).lower()
-            day = int(match.group(2))
-            year = int(match.group(3))
-            month = month_map.get(month_str, 0)
-            if month:
-                return f"{year}-{month:02d}-{day:02d}"
+    # Try simple format: "YYYY-MM-DD_CompanyName_Topic"
+    simple_match = re.match(r"^(\d{4}-\d{2}-\d{2})_([^_]+)(?:_(.+))?$", filename)
+    if simple_match:
+        return {
+            "date": simple_match.group(1),
+            "attendees": [],
+            "company": simple_match.group(2).replace("-", " ").replace("_", " "),
+            "topic": (simple_match.group(3) or "").replace("-", " ").replace("_", " "),
+        }
 
     return None
 
 
-def split_doc_by_dates(text: str) -> dict[str, str]:
-    """
-    Split document content into sections by date.
-    Returns dict mapping YYYY-MM-DD -> section content.
-    """
-    # Pattern to find date headers
-    date_pattern = r"(?:^|\n)((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4})"
-
-    sections = {}
-    matches = list(re.finditer(date_pattern, text, re.IGNORECASE))
-
-    for i, match in enumerate(matches):
-        date_str = parse_date_from_text(match.group(1))
-        if not date_str:
-            continue
-
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-
-        content = text[start:end].strip()
-        if content:
-            sections[date_str] = content
-
-    return sections
-
-
-def find_meeting_docs(drive_service, folder_id: str = None) -> list[dict]:
-    """
-    Find documents in the Granola notes folder.
-    If folder_id is provided, only searches within that folder.
-    """
-    if folder_id:
-        # Only search within the specified folder
-        query = f"'{folder_id}' in parents"
+def download_file_content(drive_service, file_id: str, mime_type: str) -> str:
+    """Download file content from Drive."""
+    if mime_type == "application/vnd.google-apps.document":
+        # Export Google Doc as plain text
+        content = drive_service.files().export(
+            fileId=file_id,
+            mimeType="text/plain"
+        ).execute()
+        return content.decode("utf-8") if isinstance(content, bytes) else content
     else:
-        # Fallback: search for meeting docs anywhere
-        query = "mimeType='application/vnd.google-apps.document' and (name contains 'Meeting' or name contains 'Agenda')"
-
-    results = drive_service.files().list(
-        q=query,
-        pageSize=100,
-        fields="files(id, name, mimeType, modifiedTime)",
-    ).execute()
-
-    return results.get("files", [])
-
-
-def extract_company_from_doc_name(doc_name: str) -> str:
-    """
-    Extract company name from doc names like:
-    - "Seeq + Folloze Meeting Agendas"
-    - "CompanyName Meeting Notes"
-    """
-    # Remove common suffixes
-    name = doc_name
-    for suffix in ["Meeting Agendas", "Meeting Agenda", "Meeting Notes", "Meetings", "+ Folloze", "- Folloze"]:
-        name = re.sub(rf"\s*{re.escape(suffix)}\s*", " ", name, flags=re.IGNORECASE)
-
-    # Clean up
-    name = re.sub(r"\s+", " ", name).strip()
-    name = name.strip("+-,. ")
-
-    return name
+        # Download regular file
+        content = drive_service.files().get_media(fileId=file_id).execute()
+        return content.decode("utf-8") if isinstance(content, bytes) else content
 
 
 def scan_drive_notes(lookback_days: Optional[int] = None) -> dict[str, dict]:
     """
-    Scan Google Drive for meeting notes.
+    Scan Google Drive Granola folder for meeting notes.
 
-    Returns dict mapping (date, company) tuple key -> {
+    Returns dict mapping key -> {
         date: YYYY-MM-DD,
-        company: company name,
+        attendees: list of attendee names,
+        company: company name (if in filename),
         content: note content,
-        doc_name: source document name
+        filename: original filename
     }
     """
     settings = load_settings()
     lookback_days = lookback_days or settings.get("lookback_days", 7)
+    folder_id = settings.get("granola_folder_id", "")
+
+    if not folder_id:
+        print("    Warning: granola_folder_id not configured in settings.json")
+        return {}
 
     creds = get_credentials()
     drive_service = build("drive", "v3", credentials=creds)
-    docs_service = build("docs", "v1", credentials=creds)
 
     # Calculate date range
     today = datetime.now()
@@ -174,38 +124,47 @@ def scan_drive_notes(lookback_days: Optional[int] = None) -> dict[str, dict]:
 
     notes = {}
 
-    # Get Granola folder ID from settings
-    folder_id = settings.get("granola_folder_id", "")
+    # List files in the Granola folder
+    results = drive_service.files().list(
+        q=f"'{folder_id}' in parents",
+        pageSize=100,
+        fields="files(id, name, mimeType, modifiedTime)",
+    ).execute()
 
-    # Find docs in the Granola folder
-    meeting_docs = find_meeting_docs(drive_service, folder_id)
+    files = results.get("files", [])
 
-    for doc in meeting_docs:
-        doc_id = doc["id"]
-        doc_name = doc["name"]
-        company = extract_company_from_doc_name(doc_name)
+    for file_info in files:
+        file_id = file_info["id"]
+        filename = file_info["name"]
+        mime_type = file_info["mimeType"]
 
-        if not company:
+        # Parse filename
+        parsed = parse_granola_filename(filename)
+        if not parsed:
             continue
 
+        # Check date is within range
+        if parsed["date"] < cutoff_str:
+            continue
+
+        # Download content
         try:
-            text = extract_doc_text(docs_service, doc_id)
-            sections = split_doc_by_dates(text)
-
-            for date_str, content in sections.items():
-                # Only include recent notes
-                if date_str >= cutoff_str:
-                    key = f"{date_str}_{company}"
-                    notes[key] = {
-                        "date": date_str,
-                        "company": company,
-                        "content": content,
-                        "doc_name": doc_name,
-                    }
-
+            content = download_file_content(drive_service, file_id, mime_type)
         except Exception as e:
-            print(f"  Warning: Could not read doc '{doc_name}': {e}")
+            print(f"    Warning: Could not read '{filename}': {e}")
             continue
+
+        # Create unique key
+        key = f"{parsed['date']}_{filename}"
+
+        notes[key] = {
+            "date": parsed["date"],
+            "attendees": parsed["attendees"],
+            "company": parsed["company"],
+            "topic": parsed["topic"],
+            "content": content,
+            "filename": filename,
+        }
 
     return notes
 
@@ -213,6 +172,7 @@ def scan_drive_notes(lookback_days: Optional[int] = None) -> dict[str, dict]:
 def match_meeting_to_note(
     meeting_date: str,
     meeting_title: str,
+    meeting_attendees: list[str],
     company_name: str,
     notes: dict[str, dict],
     threshold: int = 60,
@@ -220,9 +180,9 @@ def match_meeting_to_note(
     """
     Find a matching note for a meeting.
 
-    Uses fuzzy matching on:
+    Matching criteria:
     1. Exact date match (required)
-    2. Fuzzy match on company name
+    2. Fuzzy match on attendee names, company name, or meeting title
     """
     # Filter notes by date first
     date_notes = {k: v for k, v in notes.items() if v["date"] == meeting_date}
@@ -230,34 +190,53 @@ def match_meeting_to_note(
     if not date_notes:
         return None
 
-    # Get company names from matching notes
-    companies = [(k, v["company"]) for k, v in date_notes.items()]
+    # Try matching by attendee names
+    for key, note in date_notes.items():
+        note_attendees = note.get("attendees", [])
+        if note_attendees:
+            # Check if any meeting attendee matches any note attendee
+            for meeting_attendee in meeting_attendees:
+                # Extract name from email if needed
+                if "@" in meeting_attendee:
+                    # Try to match email prefix to name
+                    email_name = meeting_attendee.split("@")[0].replace(".", " ")
+                else:
+                    email_name = meeting_attendee
 
-    if not companies:
-        return None
+                for note_attendee in note_attendees:
+                    ratio = fuzz.token_sort_ratio(email_name.lower(), note_attendee.lower())
+                    if ratio >= threshold:
+                        return note
 
-    # Try fuzzy match on company name
+    # Try matching by company name
     if company_name:
-        company_list = [c[1] for c in companies]
-        result = process.extractOne(
-            company_name,
-            company_list,
-            scorer=fuzz.token_sort_ratio,
-        )
-        if result and result[1] >= threshold:
-            matched_company = result[0]
-            for key, note in date_notes.items():
-                if note["company"] == matched_company:
+        for key, note in date_notes.items():
+            note_company = note.get("company", "")
+            if note_company:
+                ratio = fuzz.token_sort_ratio(company_name.lower(), note_company.lower())
+                if ratio >= threshold:
                     return note
 
-    # Try matching company in meeting title
+            # Also check if company name appears in attendee names
+            for attendee in note.get("attendees", []):
+                if company_name.lower() in attendee.lower():
+                    return note
+
+    # Try matching by meeting title
     if meeting_title:
         for key, note in date_notes.items():
-            if note["company"].lower() in meeting_title.lower():
+            # Check company in title
+            if note.get("company") and note["company"].lower() in meeting_title.lower():
                 return note
 
-            # Fuzzy match title vs company
-            ratio = fuzz.token_sort_ratio(meeting_title, note["company"])
+            # Check attendee names in title
+            for attendee in note.get("attendees", []):
+                if attendee.lower() in meeting_title.lower():
+                    return note
+
+            # Fuzzy match title
+            note_desc = f"{note.get('company', '')} {note.get('topic', '')} {' '.join(note.get('attendees', []))}"
+            ratio = fuzz.token_sort_ratio(meeting_title.lower(), note_desc.lower())
             if ratio >= threshold:
                 return note
 
@@ -281,7 +260,7 @@ def get_notes_for_meetings(
     """
     print("    Scanning Google Drive for meeting notes...")
     notes = scan_drive_notes()
-    print(f"    Found {len(notes)} recent note sections")
+    print(f"    Found {len(notes)} recent notes")
 
     if not notes:
         return {}
@@ -291,6 +270,7 @@ def get_notes_for_meetings(
     for meeting in meetings:
         meeting_date = meeting["date"]
         meeting_title = meeting["title"]
+        meeting_attendees = meeting.get("attendees", [])
 
         # Try to get company name from deals config
         company_name = ""
@@ -303,6 +283,7 @@ def get_notes_for_meetings(
         note = match_meeting_to_note(
             meeting_date=meeting_date,
             meeting_title=meeting_title,
+            meeting_attendees=meeting_attendees,
             company_name=company_name,
             notes=notes,
         )
@@ -319,8 +300,10 @@ def get_notes_for_meetings(
 if __name__ == "__main__":
     # Test the module
     print("Scanning Google Drive for meeting notes...")
-    notes = scan_drive_notes()
-    print(f"Found {len(notes)} note sections")
+    notes = scan_drive_notes(lookback_days=30)
+    print(f"Found {len(notes)} notes")
     for key, note in list(notes.items())[:10]:
-        print(f"  - {note['date']}: {note['company']}")
-        print(f"    Content preview: {note['content'][:100]}...")
+        print(f"\n  Date: {note['date']}")
+        print(f"  Attendees: {', '.join(note['attendees'])}")
+        print(f"  Company: {note['company']}")
+        print(f"  Content preview: {note['content'][:200]}...")
