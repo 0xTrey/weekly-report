@@ -2,6 +2,11 @@
 credentials.json
 token.json
 
+# Config files with personal data (use .example.json as templates)
+config/settings.json
+config/partners.json
+config/active_deals.json
+
 # Environment
 .env
 .env.local

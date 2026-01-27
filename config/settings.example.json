@@ -1,0 +1,8 @@
+{
+  "granola_folder_id": "YOUR_GOOGLE_DRIVE_FOLDER_ID",
+  "ollama_endpoint": "http://localhost:11434/api/generate",
+  "ollama_model": "gemma3:27b",
+  "output_folder_id": "",
+  "lookback_days": 7,
+  "internal_domain": "yourcompany.com"
+}

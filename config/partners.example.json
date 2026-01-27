@@ -1,0 +1,8 @@
+{
+  "agency_partners": [
+    {"domain": "example-agency.com", "name": "Example Agency"}
+  ],
+  "tech_partners": [
+    {"domain": "example-tech.com", "name": "Example Tech Partner"}
+  ]
+}
