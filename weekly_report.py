@@ -5,7 +5,7 @@ Weekly Deal & Partner Report
 Main orchestration script that:
 1. Runs the interview (new domain confirmation)
 2. Collects data (calendar, Granola notes, Gmail)
-3. Synthesizes via Ollama (Gemma 2)
+3. Synthesizes via Ollama (Gemma 3)
 4. Generates Google Doc report
 5. Commits on success
 """
@@ -259,6 +259,7 @@ def main():
     parser.add_argument("--skip-interview", action="store_true", help="Skip the deal interview")
     parser.add_argument("--markdown-only", action="store_true", help="Generate Markdown instead of Google Doc")
     parser.add_argument("--no-commit", action="store_true", help="Skip git commit after completion")
+    parser.add_argument("--dry-run", action="store_true", help="Check config and connections without generating report")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -269,6 +270,49 @@ def main():
     # Check prerequisites
     if not check_prerequisites():
         sys.exit(1)
+
+    # Dry-run mode: validate config and exit
+    if args.dry_run:
+        print("\n" + "-" * 40)
+        print("DRY RUN MODE")
+        print("-" * 40)
+
+        # Check Granola folder
+        settings = load_settings()
+        granola_folder_id = settings.get("granola_folder_id", "")
+        if granola_folder_id:
+            print(f"  Granola folder ID: {granola_folder_id}")
+            # Test folder access
+            from src.granola_scanner import scan_drive_notes
+            try:
+                notes = scan_drive_notes()
+                print(f"  Granola notes found: {len(notes)}")
+            except Exception as e:
+                print(f"  Granola folder: ERROR - {e}")
+        else:
+            print("  Granola folder: NOT CONFIGURED")
+
+        # Load and display configs
+        deals = get_deals_dict()
+        agency_partners, tech_partners = get_partners()
+        print(f"  Active deals: {len(deals)}")
+        for domain, name in deals.items():
+            print(f"    - {name} ({domain})")
+        print(f"  Agency partners: {len(agency_partners)}")
+        print(f"  Tech partners: {len(tech_partners)}")
+
+        # Test Ollama
+        print("\n  Testing Ollama synthesis...")
+        test_result = synthesize("Test context: Meeting scheduled for next week.", "Test Company", "deal")
+        if test_result.startswith("Error:"):
+            print(f"    FAILED: {test_result}")
+        else:
+            print(f"    OK (received {len(test_result)} chars)")
+
+        print("\n" + "=" * 60)
+        print("DRY RUN COMPLETE - No changes made")
+        print("=" * 60)
+        sys.exit(0)
 
     # Step 1: Interview
     if not args.skip_interview:

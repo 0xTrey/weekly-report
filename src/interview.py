@@ -11,18 +11,19 @@ Human-in-the-loop setup that:
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Union
 
 from src.google_calendar import get_new_external_domains
 
 
-def load_config(filename: str) -> dict | list:
+def load_config(filename: str) -> Union[dict, list]:
     """Load a config file."""
     config_path = Path(__file__).parent.parent / "config" / filename
     with open(config_path) as f:
         return json.load(f)
 
 
-def save_config(filename: str, data: dict | list) -> None:
+def save_config(filename: str, data: Union[dict, list]) -> None:
     """Save a config file."""
     config_path = Path(__file__).parent.parent / "config" / filename
     with open(config_path, "w") as f:

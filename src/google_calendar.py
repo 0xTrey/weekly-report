@@ -2,9 +2,10 @@
 Google Calendar Client
 
 Fetches meetings for the past N days, filtering out:
-- Personal events (Purple, colorId: 1)
-- Admin events (Orange, colorId: 6)
-- Block events (Grey, colorId: 8)
+- Internal events (Lavender, colorId: 1)
+- Personal events (Grape, colorId: 3)
+- Admin events (Tangerine, colorId: 6)
+- Block events (Graphite, colorId: 8)
 - Internal-only meetings (all attendees @folloze.com)
 """
 
@@ -19,9 +20,10 @@ from googleapiclient.discovery import build
 
 # Color IDs to filter out
 EXCLUDED_COLOR_IDS = {
-    "1",  # Purple - Personal
-    "6",  # Orange - Admin
-    "8",  # Grey - Blocks
+    "1",  # Lavender - Internal
+    "3",  # Grape - Personal
+    "6",  # Tangerine - Admin
+    "8",  # Graphite - Calendar Blocks
 }
 
 
