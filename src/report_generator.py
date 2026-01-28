@@ -2,10 +2,15 @@
 Report Generator
 
 Creates Google Docs weekly reports with structured content.
-Formats: Headers (H1, H2), Bullets. No emojis. No visuals.
+Format:
+- H1: Section headers (Deal Updates, Agency Partner Updates, Tech Alliances)
+- H2: Company names
+- Bold text: Category labels (Activity, Risks, Action Items, etc.)
+- Normal text: Content (no bullets, dashes, or markdown)
 """
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,6 +34,96 @@ def get_credentials() -> Credentials:
             "token.json not found. Run setup_google_auth.py first."
         )
     return Credentials.from_authorized_user_file(str(token_path))
+
+
+def clean_content(text: str) -> str:
+    """
+    Clean LLM output by removing markdown formatting.
+    - Remove bullet points (-, *, •)
+    - Remove markdown headers (#)
+    - Remove asterisks used for bold/italic
+    - Clean up extra whitespace
+    """
+    lines = text.split("\n")
+    cleaned_lines = []
+
+    for line in lines:
+        # Strip leading/trailing whitespace
+        line = line.strip()
+
+        # Skip empty lines
+        if not line:
+            continue
+
+        # Remove leading bullets/dashes
+        line = re.sub(r"^[-*•]\s*", "", line)
+
+        # Remove markdown headers
+        line = re.sub(r"^#+\s*", "", line)
+
+        # Remove bold/italic asterisks but keep the text
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        line = re.sub(r"\*([^*]+)\*", r"\1", line)
+
+        # Clean up extra spaces
+        line = re.sub(r"\s+", " ", line).strip()
+
+        if line:
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
+def parse_content_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Parse content into sections with labels.
+
+    Looks for patterns like:
+    - "Activity:" or "Activity -"
+    - "Risks:" or "Risks -"
+    - "Action Items:" etc.
+
+    Returns list of (label, content) tuples.
+    """
+    # Clean the text first
+    text = clean_content(text)
+
+    # Known section labels
+    labels = [
+        "Activity", "Deal Status", "Status", "Risks", "Risk",
+        "Action Items", "Action Item", "Next Steps", "Summary",
+        "Notes", "Key Points", "Concerns", "Blockers"
+    ]
+
+    # Build regex pattern for labels
+    label_pattern = "|".join(re.escape(l) for l in labels)
+    pattern = rf"({label_pattern})\s*[:\-]\s*"
+
+    sections = []
+    last_end = 0
+    last_label = None
+
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        # Save previous section
+        if last_label is not None:
+            content = text[last_end:match.start()].strip()
+            if content:
+                sections.append((last_label, content))
+
+        last_label = match.group(1)
+        last_end = match.end()
+
+    # Save final section
+    if last_label is not None:
+        content = text[last_end:].strip()
+        if content:
+            sections.append((last_label, content))
+
+    # If no sections found, return entire text as "Summary"
+    if not sections and text.strip():
+        sections.append(("Summary", text.strip()))
+
+    return sections
 
 
 def create_google_doc(
@@ -82,19 +177,20 @@ def build_document_requests(
 
     Structure:
     - H1: Weekly Report - [Date]
-    - H2: Deal Updates
-      - Each deal as bullet points
-    - H2: Agency Partner Updates
-      - Each partner as bullet points
-    - H2: Tech Alliance Updates
-      - Each partner as bullet points
+    - H1: Deal Updates
+      - H2: Company Name
+        - Bold: Activity
+        - Normal: content
+    - H1: Agency Partner Updates
+    - H1: Tech Alliances
     """
     requests = []
     current_index = 1  # Start after the document beginning
+    bold_ranges = []  # Track ranges to make bold
 
-    def add_text(text: str, style: Optional[str] = None) -> int:
+    def add_text(text: str, style: Optional[str] = None, bold: bool = False) -> int:
         """Add text and return the new index position."""
-        nonlocal current_index, requests
+        nonlocal current_index, requests, bold_ranges
 
         requests.append({
             "insertText": {
@@ -103,13 +199,14 @@ def build_document_requests(
             }
         })
 
+        start_index = current_index
         end_index = current_index + len(text)
 
         if style == "HEADING_1":
             requests.append({
                 "updateParagraphStyle": {
                     "range": {
-                        "startIndex": current_index,
+                        "startIndex": start_index,
                         "endIndex": end_index,
                     },
                     "paragraphStyle": {"namedStyleType": "HEADING_1"},
@@ -120,7 +217,7 @@ def build_document_requests(
             requests.append({
                 "updateParagraphStyle": {
                     "range": {
-                        "startIndex": current_index,
+                        "startIndex": start_index,
                         "endIndex": end_index,
                     },
                     "paragraphStyle": {"namedStyleType": "HEADING_2"},
@@ -128,29 +225,39 @@ def build_document_requests(
                 }
             })
 
+        if bold:
+            # Store range to bold later (exclude newline)
+            text_end = end_index - 1 if text.endswith("\n") else end_index
+            bold_ranges.append((start_index, text_end))
+
         current_index = end_index
         return current_index
 
+    def add_entity_content(entity_name: str, content: str) -> None:
+        """Add an entity (company) with its content."""
+        # Company name as H2
+        add_text(f"{entity_name}\n", "HEADING_2")
+
+        # Parse content into sections
+        sections = parse_content_sections(content)
+
+        for label, section_content in sections:
+            # Label as bold
+            add_text(f"{label}: ", bold=True)
+            # Content as normal text
+            add_text(f"{section_content}\n\n")
+
     def add_section(title: str, updates: dict[str, str]) -> None:
-        """Add a section with H2 header and bulleted content."""
+        """Add a section with H1 header and entity content."""
         if not updates:
             return
 
-        # Add section header
-        add_text(f"\n{title}\n", "HEADING_2")
+        # Section header as H1
+        add_text(f"{title}\n", "HEADING_1")
 
-        # Add each entity's update
+        # Add each entity
         for entity_name, content in updates.items():
-            # Entity name as bold
-            add_text(f"\n{entity_name}\n")
-
-            # Content as bullets (each line becomes a bullet)
-            for line in content.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("-"):
-                    line = f"- {line}"
-                if line:
-                    add_text(f"{line}\n")
+            add_entity_content(entity_name, content)
 
     # Main title
     add_text(f"Weekly Report - {report_date}\n", "HEADING_1")
@@ -158,7 +265,20 @@ def build_document_requests(
     # Sections
     add_section("Deal Updates", deal_updates)
     add_section("Agency Partner Updates", agency_updates)
-    add_section("Tech Alliance Updates", tech_updates)
+    add_section("Tech Alliances", tech_updates)
+
+    # Add bold formatting requests at the end
+    for start, end in bold_ranges:
+        requests.append({
+            "updateTextStyle": {
+                "range": {
+                    "startIndex": start,
+                    "endIndex": end,
+                },
+                "textStyle": {"bold": True},
+                "fields": "bold",
+            }
+        })
 
     return requests
 
@@ -237,23 +357,21 @@ def generate_markdown_report(
         if not updates:
             return
 
-        lines.append(f"## {title}")
+        lines.append(f"# {title}")
         lines.append("")
 
         for entity_name, content in updates.items():
-            lines.append(f"### {entity_name}")
+            lines.append(f"## {entity_name}")
             lines.append("")
-            for line in content.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("-"):
-                    line = f"- {line}"
-                if line:
-                    lines.append(line)
-            lines.append("")
+
+            sections = parse_content_sections(content)
+            for label, section_content in sections:
+                lines.append(f"**{label}:** {section_content}")
+                lines.append("")
 
     add_section("Deal Updates", deal_updates)
     add_section("Agency Partner Updates", agency_updates)
-    add_section("Tech Alliance Updates", tech_updates)
+    add_section("Tech Alliances", tech_updates)
 
     content = "\n".join(lines)
 
@@ -272,13 +390,13 @@ if __name__ == "__main__":
     print("Generating test report...")
 
     test_deals = {
-        "Acme Corp": "- Activity: 2 meetings, 5 email threads\n- Deal Status: Pricing discussion ongoing\n- Action Items: Send revised proposal",
+        "Acme Corp": "Activity: 2 meetings, 5 email threads. Deal Status: Pricing discussion ongoing. Action Items: Send revised proposal by Friday.",
     }
     test_agencies = {
-        "Agency One": "- Activity: Quarterly review meeting\n- Action Items: Schedule follow-up",
+        "Agency One": "Activity: Quarterly review meeting. Action Items: Schedule follow-up for next month.",
     }
     test_tech = {
-        "Tech Partner": "- Activity: Integration testing\n- Risks: API changes pending",
+        "Tech Partner": "Activity: Integration testing completed. Risks: API changes pending in Q2.",
     }
 
     # Generate markdown (doesn't require Google auth)
