@@ -1,13 +1,13 @@
 # Weekly Deal & Partner Report
 
-Automated weekly report generator that aggregates data from Google Calendar, Gmail, and meeting notes (Google Drive) to produce executive summaries using a local LLM.
+Automated weekly report generator that aggregates data from Google Calendar, Gmail, and Granola meeting notes to produce executive summaries using a local LLM.
 
 ## Features
 
 - Scans Google Calendar for external meetings (filters out internal, personal, admin events)
 - Retrieves email threads with deals and partners from Gmail
-- Matches meetings with notes stored in Google Drive
-- Synthesizes updates using local Ollama (Gemma 3) for privacy
+- Matches meetings with Granola notes from the local cache (by calendar event ID)
+- Synthesizes updates using LLMGateway (local Ollama, falls back to cloud)
 - Generates formatted Google Docs or Markdown reports
 - Human-in-the-loop deal classification from calendar contacts
 
@@ -15,8 +15,8 @@ Automated weekly report generator that aggregates data from Google Calendar, Gma
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ Google Calendar │     │     Gmail       │     │  Google Drive   │
-│   (meetings)    │     │   (threads)     │     │ (meeting notes) │
+│ Google Calendar │     │     Gmail       │     │  Granola Cache  │
+│   (meetings)    │     │   (threads)     │     │ (notes/panels)  │
 └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
          │                       │                       │
          └───────────────────────┼───────────────────────┘
@@ -24,13 +24,13 @@ Automated weekly report generator that aggregates data from Google Calendar, Gma
                                  ▼
                     ┌────────────────────────┐
                     │   Data Collection &    │
-                    │      Matching          │
+                    │   Calendar ID Matching │
                     └───────────┬────────────┘
                                 │
                                 ▼
                     ┌────────────────────────┐
-                    │   Ollama (Gemma 3)     │
-                    │   Local Synthesis      │
+                    │   LLMGateway           │
+                    │   (local -> cloud)     │
                     └───────────┬────────────┘
                                 │
                                 ▼
@@ -41,33 +41,25 @@ Automated weekly report generator that aggregates data from Google Calendar, Gma
 
 ## Prerequisites
 
-- Python 3.9+
-- [Ollama](https://ollama.ai) with gemma3:27b model
+- Python 3.10+
+- [Ollama](https://ollama.ai) with a supported model (e.g. gemma3:27b)
 - Google Cloud project with OAuth credentials
+- [Granola](https://granola.so) installed (provides local meeting cache)
+- `granola-reader` package installed (`pip install -e ~/Projects/granola-reader`)
 
 ### Install Ollama and model
 
 ```bash
-# Install Ollama (macOS)
 brew install ollama
-
-# Or download from https://ollama.ai
-
-# Pull the model (~17GB)
 ollama pull gemma3:27b
-
-# Start Ollama server
 ollama serve
 ```
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/YOUR_USERNAME/weekly-report.git
+git clone https://github.com/0xTrey/weekly-report.git
 cd weekly-report
-
-# Install dependencies
 pip install -r requirements.txt
 
 # Set up Google API credentials
@@ -94,7 +86,6 @@ python setup_google_auth.py
 
 ```json
 {
-  "granola_folder_id": "YOUR_GOOGLE_DRIVE_FOLDER_ID",
   "ollama_endpoint": "http://localhost:11434/api/generate",
   "ollama_model": "gemma3:27b",
   "output_folder_id": "",
@@ -105,7 +96,6 @@ python setup_google_auth.py
 
 | Setting | Description |
 |---------|-------------|
-| `granola_folder_id` | Google Drive folder ID containing meeting notes |
 | `ollama_model` | Ollama model to use for synthesis |
 | `output_folder_id` | Drive folder for generated reports (optional) |
 | `lookback_days` | Days to look back for activity |
@@ -134,6 +124,17 @@ Managed via the interview process or manually:
 ]
 ```
 
+## Meeting notes (Granola)
+
+Meeting notes come from Granola's local Electron cache at `~/Library/Application Support/Granola/cache-v3.json`. The scanner matches Granola documents to calendar meetings by Google Calendar event ID (primary) with a date+title fallback.
+
+Content priority:
+1. Panel content (AI-generated structured summaries from Granola)
+2. User's typed notes in markdown
+3. Plain text notes
+
+This replaced the earlier Google Drive-based approach which required exporting notes to Drive and fuzzy-matching on filenames. The local cache is faster, more reliable, and provides richer data (panels, transcripts, attendees).
+
 ## Usage
 
 ### Full workflow
@@ -144,8 +145,8 @@ python weekly_report.py
 
 This will:
 1. Interview you about new external domains from calendar
-2. Collect calendar, email, and notes data
-3. Synthesize summaries via Ollama
+2. Collect calendar, email, and Granola data
+3. Synthesize summaries via LLMGateway
 4. Generate a Google Doc report
 
 ### Options
@@ -179,22 +180,13 @@ Events with these colors are excluded:
 
 Customize in `src/google_calendar.py` if your color scheme differs.
 
-## Meeting notes format
-
-Notes in the Google Drive folder can be:
-
-1. **Google Docs** with date headers like "January 27, 2026"
-2. **Text files** named `YYYY-MM-DD_CompanyName_Topic.txt`
-
-The scanner matches notes to calendar meetings by date and company name.
-
 ## Report output
 
 Generated reports include:
 
-- **Deal Updates**: Activity, status, risks, action items
-- **Agency Partner Updates**: Partner interaction summaries
-- **Tech Alliance Updates**: Tech partner summaries
+- Deal updates: activity, status, risks, action items
+- Agency partner updates: partner interaction summaries
+- Tech alliance updates: tech partner summaries
 
 ## Project structure
 
@@ -207,8 +199,8 @@ weekly-report/
 ├── src/
 │   ├── google_calendar.py   # Calendar API client
 │   ├── gmail_client.py      # Gmail API client
-│   ├── granola_scanner.py   # Drive notes scanner
-│   ├── ollama_client.py     # Ollama LLM interface
+│   ├── granola_scanner.py   # Local Granola cache scanner
+│   ├── ollama_client.py     # LLMGateway interface
 │   ├── report_generator.py  # Report output
 │   └── interview.py         # Deal classification
 ├── logs/                    # Markdown reports
@@ -223,18 +215,8 @@ weekly-report/
 
 See [SECURITY.md](SECURITY.md) for handling credentials.
 
-**Never commit:**
-- `credentials.json`
-- `token.json`
-- `.env` files
+Never commit: `credentials.json`, `token.json`, `.env` files.
 
 ## License
 
 MIT
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
