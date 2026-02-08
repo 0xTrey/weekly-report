@@ -14,8 +14,11 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+
+import requests
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -33,6 +36,81 @@ def load_settings() -> dict:
     settings_path = Path(__file__).parent / "config" / "settings.json"
     with open(settings_path) as f:
         return json.load(f)
+
+
+def start_ollama() -> tuple[bool, bool]:
+    """
+    Start Ollama server if not already running.
+
+    Returns:
+        (success, we_started_it) - second bool tracks if this script started Ollama
+    """
+    # Check if already running
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        if response.status_code == 200:
+            print("  Ollama: Already running (external session)")
+            return True, False
+    except requests.exceptions.RequestException:
+        pass
+
+    # Start Ollama in background
+    print("  Starting Ollama...")
+    subprocess.Popen(
+        ["ollama", "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for ready (up to 30 seconds)
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            response = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if response.status_code == 200:
+                print("  Ollama: Started")
+                return True, True
+        except requests.exceptions.RequestException:
+            continue
+
+    print("  ERROR: Ollama failed to start")
+    return False, False
+
+
+def stop_ollama():
+    """Stop Ollama server and free memory."""
+    print("\nCleaning up Ollama...")
+
+    # Unload models first (graceful)
+    try:
+        response = requests.get("http://localhost:11434/api/ps", timeout=5)
+        if response.status_code == 200:
+            running = response.json().get("models", [])
+            for model in running:
+                model_name = model.get("name", "")
+                if model_name:
+                    requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={"model": model_name, "keep_alive": 0},
+                        timeout=10,
+                    )
+                    print(f"  Unloaded: {model_name}")
+    except requests.exceptions.RequestException:
+        pass
+
+    time.sleep(2)
+
+    # Stop the server
+    subprocess.run(["pkill", "ollama"], capture_output=True)
+    time.sleep(2)
+
+    # Force kill if still running
+    result = subprocess.run(["pgrep", "-x", "ollama"], capture_output=True)
+    if result.returncode == 0:
+        subprocess.run(["pkill", "-9", "ollama"], capture_output=True)
+        print("  Ollama: Force stopped")
+    else:
+        print("  Ollama: Stopped")
 
 
 def check_prerequisites() -> bool:
@@ -267,108 +345,90 @@ def main():
     print("=" * 60)
     print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    # Check prerequisites
-    if not check_prerequisites():
+    # Start Ollama (tracks if we started it)
+    ollama_ok, we_started_ollama = start_ollama()
+    if not ollama_ok:
         sys.exit(1)
 
-    # Dry-run mode: validate config and exit
-    if args.dry_run:
-        print("\n" + "-" * 40)
-        print("DRY RUN MODE")
-        print("-" * 40)
+    try:
+        # Check prerequisites
+        if not check_prerequisites():
+            sys.exit(1)
 
-        # Check Granola folder
-        settings = load_settings()
-        granola_folder_id = settings.get("granola_folder_id", "")
-        if granola_folder_id:
-            print(f"  Granola folder ID: {granola_folder_id}")
-            # Test folder access
-            from src.granola_scanner import scan_drive_notes
+        # Dry-run mode: validate config and exit
+        if args.dry_run:
+            print("\n" + "-" * 40)
+            print("DRY RUN MODE")
+            print("-" * 40)
+
+            # Check Granola local cache
+            from src.granola_scanner import scan_local_notes
             try:
-                notes = scan_drive_notes()
-                print(f"  Granola notes found: {len(notes)}")
+                notes = scan_local_notes()
+                print(f"  Granola cache: OK ({len(notes)} notes with content)")
+            except FileNotFoundError as e:
+                print(f"  Granola cache: NOT FOUND - {e}")
             except Exception as e:
-                print(f"  Granola folder: ERROR - {e}")
-        else:
-            print("  Granola folder: NOT CONFIGURED")
+                print(f"  Granola cache: ERROR - {e}")
 
-        # Load and display configs
+            # Load and display configs
+            deals = get_deals_dict()
+            agency_partners, tech_partners = get_partners()
+            print(f"  Active deals: {len(deals)}")
+            for domain, name in deals.items():
+                print(f"    - {name} ({domain})")
+            print(f"  Agency partners: {len(agency_partners)}")
+            print(f"  Tech partners: {len(tech_partners)}")
+
+            # Test Ollama
+            print("\n  Testing Ollama synthesis...")
+            test_result = synthesize("Test context: Meeting scheduled for next week.", "Test Company", "deal")
+            if test_result.startswith("Error:"):
+                print(f"    FAILED: {test_result}")
+            else:
+                print(f"    OK (received {len(test_result)} chars)")
+
+            print("\n" + "=" * 60)
+            print("DRY RUN COMPLETE - No changes made")
+            print("=" * 60)
+            sys.exit(0)
+
+        # Step 1: Interview
+        if not args.skip_interview:
+            run_interview()
+        else:
+            print("\nSkipping interview (--skip-interview)")
+
+        # Load entity configs
         deals = get_deals_dict()
         agency_partners, tech_partners = get_partners()
-        print(f"  Active deals: {len(deals)}")
-        for domain, name in deals.items():
-            print(f"    - {name} ({domain})")
-        print(f"  Agency partners: {len(agency_partners)}")
-        print(f"  Tech partners: {len(tech_partners)}")
 
-        # Test Ollama
-        print("\n  Testing Ollama synthesis...")
-        test_result = synthesize("Test context: Meeting scheduled for next week.", "Test Company", "deal")
-        if test_result.startswith("Error:"):
-            print(f"    FAILED: {test_result}")
-        else:
-            print(f"    OK (received {len(test_result)} chars)")
+        if not deals and not agency_partners and not tech_partners:
+            print("\nNo deals or partners configured. Add some to config files and try again.")
+            sys.exit(0)
 
-        print("\n" + "=" * 60)
-        print("DRY RUN COMPLETE - No changes made")
-        print("=" * 60)
-        sys.exit(0)
+        print(f"\nTracking: {len(deals)} deals, {len(agency_partners)} agencies, {len(tech_partners)} tech partners")
 
-    # Step 1: Interview
-    if not args.skip_interview:
-        run_interview()
-    else:
-        print("\nSkipping interview (--skip-interview)")
+        # Step 2: Collect data
+        data = collect_data(deals, agency_partners, tech_partners)
 
-    # Load entity configs
-    deals = get_deals_dict()
-    agency_partners, tech_partners = get_partners()
-
-    if not deals and not agency_partners and not tech_partners:
-        print("\nNo deals or partners configured. Add some to config files and try again.")
-        sys.exit(0)
-
-    print(f"\nTracking: {len(deals)} deals, {len(agency_partners)} agencies, {len(tech_partners)} tech partners")
-
-    # Step 2: Collect data
-    data = collect_data(deals, agency_partners, tech_partners)
-
-    # Step 3: Synthesize
-    deal_updates, agency_updates, tech_updates = synthesize_updates(
-        data, deals, agency_partners, tech_partners
-    )
-
-    total_updates = len(deal_updates) + len(agency_updates) + len(tech_updates)
-    if total_updates == 0:
-        print("\nNo activity found for the reporting period. No report generated.")
-        sys.exit(0)
-
-    print(f"\nGenerated updates: {len(deal_updates)} deals, {len(agency_updates)} agencies, {len(tech_updates)} tech")
-
-    # Step 4: Generate report
-    print("\nGenerating report...")
-    report_date = datetime.now().strftime("%Y-%m-%d")
-
-    if args.markdown_only:
-        output_path = generate_markdown_report(
-            deal_updates=deal_updates,
-            agency_updates=agency_updates,
-            tech_updates=tech_updates,
-            report_date=report_date,
+        # Step 3: Synthesize
+        deal_updates, agency_updates, tech_updates = synthesize_updates(
+            data, deals, agency_partners, tech_partners
         )
-        print(f"  Markdown report: {output_path}")
-    else:
-        try:
-            doc_id, doc_url = generate_report(
-                deal_updates=deal_updates,
-                agency_updates=agency_updates,
-                tech_updates=tech_updates,
-                report_date=report_date,
-            )
-            print(f"  Google Doc: {doc_url}")
-        except Exception as e:
-            print(f"  Error creating Google Doc: {e}")
-            print("  Falling back to Markdown...")
+
+        total_updates = len(deal_updates) + len(agency_updates) + len(tech_updates)
+        if total_updates == 0:
+            print("\nNo activity found for the reporting period. No report generated.")
+            sys.exit(0)
+
+        print(f"\nGenerated updates: {len(deal_updates)} deals, {len(agency_updates)} agencies, {len(tech_updates)} tech")
+
+        # Step 4: Generate report
+        print("\nGenerating report...")
+        report_date = datetime.now().strftime("%Y-%m-%d")
+
+        if args.markdown_only:
             output_path = generate_markdown_report(
                 deal_updates=deal_updates,
                 agency_updates=agency_updates,
@@ -376,15 +436,41 @@ def main():
                 report_date=report_date,
             )
             print(f"  Markdown report: {output_path}")
+        else:
+            try:
+                doc_id, doc_url = generate_report(
+                    deal_updates=deal_updates,
+                    agency_updates=agency_updates,
+                    tech_updates=tech_updates,
+                    report_date=report_date,
+                )
+                print(f"  Google Doc: {doc_url}")
+            except Exception as e:
+                print(f"  Error creating Google Doc: {e}")
+                print("  Falling back to Markdown...")
+                output_path = generate_markdown_report(
+                    deal_updates=deal_updates,
+                    agency_updates=agency_updates,
+                    tech_updates=tech_updates,
+                    report_date=report_date,
+                )
+                print(f"  Markdown report: {output_path}")
 
-    # Step 5: Git commit
-    if not args.no_commit:
-        print("\nCommitting changes...")
-        git_commit(f"Weekly report generated: {report_date}")
+        # Step 5: Git commit
+        if not args.no_commit:
+            print("\nCommitting changes...")
+            git_commit(f"Weekly report generated: {report_date}")
 
-    print("\n" + "=" * 60)
-    print("COMPLETE")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("COMPLETE")
+        print("=" * 60)
+
+    finally:
+        # Cleanup: only stop Ollama if this script started it
+        if we_started_ollama:
+            stop_ollama()
+        else:
+            print("\n  Ollama: Left running (external session)")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """
 Ollama Client
 
-Interfaces with local Ollama instance running Gemma 2.
-Handles health checks, model verification, and LLM synthesis.
+Uses LLMGateway for local-first LLM synthesis.
+Falls back to 'strategic' profile (Gemini) when Ollama is unavailable.
 """
 
 import json
@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+
+from llm_gateway import LLMGateway
 
 
 def load_settings() -> dict:
@@ -20,9 +22,7 @@ def load_settings() -> dict:
 
 
 def check_ollama_running(endpoint: Optional[str] = None) -> bool:
-    """
-    Check if Ollama is running and accessible.
-    """
+    """Check if Ollama is running and accessible."""
     settings = load_settings()
     endpoint = endpoint or settings.get("ollama_endpoint", "http://localhost:11434/api/generate")
     base_url = endpoint.rsplit("/api", 1)[0]
@@ -35,11 +35,9 @@ def check_ollama_running(endpoint: Optional[str] = None) -> bool:
 
 
 def check_model_available(model: Optional[str] = None) -> bool:
-    """
-    Check if the specified model is available in Ollama.
-    """
+    """Check if the specified model is available in Ollama."""
     settings = load_settings()
-    model = model or settings.get("ollama_model", "gemma2:27b")
+    model = model or settings.get("ollama_model", "gemma3:27b")
     endpoint = settings.get("ollama_endpoint", "http://localhost:11434/api/generate")
     base_url = endpoint.rsplit("/api", 1)[0]
 
@@ -61,9 +59,7 @@ def check_model_available(model: Optional[str] = None) -> bool:
 
 
 def get_available_models() -> list[str]:
-    """
-    Get list of available models in Ollama.
-    """
+    """Get list of available models in Ollama."""
     settings = load_settings()
     endpoint = settings.get("ollama_endpoint", "http://localhost:11434/api/generate")
     base_url = endpoint.rsplit("/api", 1)[0]
@@ -95,6 +91,18 @@ Context:
 Provide a concise summary following the structure above. If certain sections don't apply (e.g., no known deal status for partners), omit them."""
 
 
+def _get_gateway(model: Optional[str] = None) -> LLMGateway:
+    """Return a local gateway, falling back to strategic (Gemini) if Ollama is down."""
+    settings = load_settings()
+    local_model = model or settings.get("ollama_model", "gemma3:27b")
+
+    if check_ollama_running():
+        return LLMGateway(profile="local", model=local_model)
+
+    print("  [gateway] Ollama unavailable, bursting to Gemini...")
+    return LLMGateway(profile="strategic")
+
+
 def synthesize(
     context: str,
     entity_name: str,
@@ -102,68 +110,34 @@ def synthesize(
     model: Optional[str] = None,
 ) -> str:
     """
-    Synthesize meeting notes and emails into a summary using Ollama.
+    Synthesize meeting notes and emails into a summary.
 
-    Args:
-        context: Combined email and meeting note content
-        entity_name: Name of the deal/partner
-        entity_type: "deal", "agency_partner", or "tech_partner"
-        model: Ollama model to use (defaults to settings)
-
-    Returns:
-        Synthesized summary text
+    Uses local Ollama by default, bursts to Gemini if Ollama is unavailable.
     """
-    settings = load_settings()
-    model = model or settings.get("ollama_model", "gemma2:27b")
-    endpoint = settings.get("ollama_endpoint", "http://localhost:11434/api/generate")
-
-    prompt = SYNTHESIS_PROMPT.format(context=context)
-
-    # Add entity context
-    prompt = f"Entity: {entity_name} ({entity_type})\n\n{prompt}"
+    gateway = _get_gateway(model)
+    prompt = f"Entity: {entity_name} ({entity_type})\n\n{SYNTHESIS_PROMPT.format(context=context)}"
 
     try:
-        response = requests.post(
-            endpoint,
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                },
-            },
-            timeout=120,
+        return gateway.chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=2048,
         )
-
-        if response.status_code != 200:
-            return f"Error: Ollama returned status {response.status_code}"
-
-        data = response.json()
-        return data.get("response", "").strip()
-
-    except requests.exceptions.Timeout:
-        return "Error: Ollama request timed out"
-    except requests.exceptions.RequestException as e:
-        return f"Error: Could not connect to Ollama - {e}"
+    except Exception as e:
+        return f"Error: LLM request failed - {e}"
 
 
 def verify_ollama_setup() -> tuple[bool, str]:
-    """
-    Verify Ollama is properly set up.
-
-    Returns:
-        (success: bool, message: str)
-    """
+    """Verify Ollama is properly set up."""
     settings = load_settings()
-    model = settings.get("ollama_model", "gemma2:27b")
+    model = settings.get("ollama_model", "gemma3:27b")
 
     if not check_ollama_running():
         return False, (
             "Ollama is not running. Start it with:\n"
             "  ollama serve\n\n"
-            "Or install Ollama from: https://ollama.ai"
+            "Or install Ollama from: https://ollama.ai\n\n"
+            "Note: The gateway will auto-burst to Gemini if Ollama is unavailable."
         )
 
     available = get_available_models()
@@ -186,7 +160,6 @@ def verify_ollama_setup() -> tuple[bool, str]:
 
 
 if __name__ == "__main__":
-    # Test the module
     print("Checking Ollama setup...")
     success, message = verify_ollama_setup()
     print(message)

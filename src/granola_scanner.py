@@ -1,23 +1,20 @@
 """
 Granola Notes Scanner
 
-Reads meeting notes from Google Drive folder.
-Supports two filename formats:
-1. ISO datetime: "2026-01-26T08:00:00-06:00 - Attendee Names"
-2. Simple date: "YYYY-MM-DD_CompanyName_Topic.txt"
+Reads meeting notes from the local Granola cache.
+Matches Granola documents to calendar meetings by Google Calendar event ID.
+Falls back to title matching when event IDs don't align.
 
-Matches notes to calendar meetings by date and attendee names.
+Uses granola_reader (~/Projects/granola-reader) for cache access.
 """
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from rapidfuzz import fuzz, process
+from granola_reader import GranolaReader
 
 
 def load_settings() -> dict:
@@ -27,220 +24,105 @@ def load_settings() -> dict:
         return json.load(f)
 
 
-def get_credentials() -> Credentials:
-    """Load credentials from token.json."""
-    token_path = Path(__file__).parent.parent / "token.json"
-    if not token_path.exists():
-        raise FileNotFoundError(
-            "token.json not found. Run setup_google_auth.py first."
-        )
-    return Credentials.from_authorized_user_file(str(token_path))
-
-
-def parse_granola_filename(filename: str) -> Optional[dict]:
+def _build_note_content(gr: GranolaReader, doc_id: str) -> str:
     """
-    Parse a Granola note filename.
+    Build the best available note content for a document.
 
-    Supports formats:
-    1. "2026-01-26T08:00:00-06:00 - Trey Harnden and Christoffer Oxenius"
-    2. "YYYY-MM-DD_CompanyName_Topic.txt"
-
-    Returns: {date, attendees, company, topic} or None
+    Priority:
+    1. Panel content (AI-generated structured summary) - richest
+    2. notes_markdown (user's typed notes in markdown)
+    3. notes_plain (plain text fallback)
     """
-    # Remove file extension if present
-    if filename.endswith(".txt"):
-        filename = filename[:-4]
+    notes = gr.get_notes(doc_id, format="markdown")
 
-    # Try ISO datetime format: "2026-01-26T08:00:00-06:00 - Names"
-    iso_match = re.match(r"^(\d{4}-\d{2}-\d{2})T[\d:+-]+ - (.+)$", filename)
-    if iso_match:
-        date_str = iso_match.group(1)
-        attendees_str = iso_match.group(2)
-        # Parse attendee names (split by "and" or ",")
-        attendees = re.split(r"\s+and\s+|,\s*", attendees_str)
-        attendees = [a.strip() for a in attendees if a.strip()]
-        return {
-            "date": date_str,
-            "attendees": attendees,
-            "company": "",
-            "topic": "",
-        }
+    parts = []
 
-    # Try simple format: "YYYY-MM-DD_CompanyName_Topic"
-    simple_match = re.match(r"^(\d{4}-\d{2}-\d{2})_([^_]+)(?:_(.+))?$", filename)
-    if simple_match:
-        return {
-            "date": simple_match.group(1),
-            "attendees": [],
-            "company": simple_match.group(2).replace("-", " ").replace("_", " "),
-            "topic": (simple_match.group(3) or "").replace("-", " ").replace("_", " "),
-        }
+    # Panel summaries are the richest source
+    for panel in notes.get("panels", []):
+        content = panel.get("content", "").strip()
+        if content:
+            if panel.get("title"):
+                parts.append(f"## {panel['title']}")
+            parts.append(content)
 
-    return None
+    # User's own notes (typed during meeting)
+    user_notes = notes.get("user_notes", "").strip()
+    if user_notes:
+        parts.append("## Meeting Notes")
+        parts.append(user_notes)
+
+    return "\n\n".join(parts)
 
 
-def download_file_content(drive_service, file_id: str, mime_type: str) -> str:
-    """Download file content from Drive."""
-    if mime_type == "application/vnd.google-apps.document":
-        # Export Google Doc as plain text
-        content = drive_service.files().export(
-            fileId=file_id,
-            mimeType="text/plain"
-        ).execute()
-        return content.decode("utf-8") if isinstance(content, bytes) else content
-    else:
-        # Download regular file
-        content = drive_service.files().get_media(fileId=file_id).execute()
-        return content.decode("utf-8") if isinstance(content, bytes) else content
-
-
-def scan_drive_notes(lookback_days: Optional[int] = None) -> dict[str, dict]:
+def _build_calendar_id_index(gr: GranolaReader, lookback_days: int) -> dict[str, str]:
     """
-    Scan Google Drive Granola folder for meeting notes.
+    Build a mapping of Google Calendar event ID -> Granola document ID.
 
-    Returns dict mapping key -> {
-        date: YYYY-MM-DD,
-        attendees: list of attendee names,
-        company: company name (if in filename),
-        content: note content,
-        filename: original filename
-    }
+    This enables O(1) matching instead of scanning all documents per meeting.
     """
-    settings = load_settings()
-    lookback_days = lookback_days or settings.get("lookback_days", 7)
-    folder_id = settings.get("granola_folder_id", "")
+    state = gr._load()
+    docs = state["documents"]
 
-    if not folder_id:
-        print("    Warning: granola_folder_id not configured in settings.json")
-        return {}
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=lookback_days)
 
-    creds = get_credentials()
-    drive_service = build("drive", "v3", credentials=creds)
-
-    # Calculate date range
-    today = datetime.now()
-    cutoff = today - timedelta(days=lookback_days)
-    cutoff_str = cutoff.strftime("%Y-%m-%d")
-
-    notes = {}
-
-    # List files in the Granola folder
-    results = drive_service.files().list(
-        q=f"'{folder_id}' in parents",
-        pageSize=100,
-        fields="files(id, name, mimeType, modifiedTime)",
-    ).execute()
-
-    files = results.get("files", [])
-
-    for file_info in files:
-        file_id = file_info["id"]
-        filename = file_info["name"]
-        mime_type = file_info["mimeType"]
-
-        # Parse filename
-        parsed = parse_granola_filename(filename)
-        if not parsed:
+    index = {}
+    for doc_id, doc in docs.items():
+        if doc.get("deleted_at"):
             continue
 
-        # Check date is within range
-        if parsed["date"] < cutoff_str:
+        created = doc.get("created_at", "")
+        if not created:
             continue
 
-        # Download content
         try:
-            content = download_file_content(drive_service, file_id, mime_type)
-        except Exception as e:
-            print(f"    Warning: Could not read '{filename}': {e}")
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if dt < cutoff:
+                continue
+        except ValueError:
             continue
 
-        # Create unique key
-        key = f"{parsed['date']}_{filename}"
+        gce = doc.get("google_calendar_event") or {}
+        cal_id = gce.get("id", "")
+        if cal_id:
+            index[cal_id] = doc_id
 
-        notes[key] = {
-            "date": parsed["date"],
-            "attendees": parsed["attendees"],
-            "company": parsed["company"],
-            "topic": parsed["topic"],
-            "content": content,
-            "filename": filename,
-        }
-
-    return notes
+    return index
 
 
-def match_meeting_to_note(
-    meeting_date: str,
-    meeting_title: str,
-    meeting_attendees: list[str],
-    company_name: str,
-    notes: dict[str, dict],
-    threshold: int = 60,
-) -> Optional[dict]:
+def _build_title_index(gr: GranolaReader, lookback_days: int) -> dict[str, str]:
     """
-    Find a matching note for a meeting.
-
-    Matching criteria:
-    1. Exact date match (required)
-    2. Fuzzy match on attendee names, company name, or meeting title
+    Build a mapping of (date, normalized_title) -> Granola document ID.
+    Used as fallback when calendar event ID matching fails.
     """
-    # Filter notes by date first
-    date_notes = {k: v for k, v in notes.items() if v["date"] == meeting_date}
+    state = gr._load()
+    docs = state["documents"]
 
-    if not date_notes:
-        return None
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=lookback_days)
 
-    # Try matching by attendee names
-    for key, note in date_notes.items():
-        note_attendees = note.get("attendees", [])
-        if note_attendees:
-            # Check if any meeting attendee matches any note attendee
-            for meeting_attendee in meeting_attendees:
-                # Extract name from email if needed
-                if "@" in meeting_attendee:
-                    # Try to match email prefix to name
-                    email_name = meeting_attendee.split("@")[0].replace(".", " ")
-                else:
-                    email_name = meeting_attendee
+    index = {}
+    for doc_id, doc in docs.items():
+        if doc.get("deleted_at"):
+            continue
 
-                for note_attendee in note_attendees:
-                    ratio = fuzz.token_sort_ratio(email_name.lower(), note_attendee.lower())
-                    if ratio >= threshold:
-                        return note
+        created = doc.get("created_at", "")
+        if not created:
+            continue
 
-    # Try matching by company name
-    if company_name:
-        for key, note in date_notes.items():
-            note_company = note.get("company", "")
-            if note_company:
-                ratio = fuzz.token_sort_ratio(company_name.lower(), note_company.lower())
-                if ratio >= threshold:
-                    return note
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if dt < cutoff:
+                continue
+        except ValueError:
+            continue
 
-            # Also check if company name appears in attendee names
-            for attendee in note.get("attendees", []):
-                if company_name.lower() in attendee.lower():
-                    return note
+        title = doc.get("title", "").strip().lower()
+        date = created[:10]
+        if title:
+            index[(date, title)] = doc_id
 
-    # Try matching by meeting title
-    if meeting_title:
-        for key, note in date_notes.items():
-            # Check company in title
-            if note.get("company") and note["company"].lower() in meeting_title.lower():
-                return note
-
-            # Check attendee names in title
-            for attendee in note.get("attendees", []):
-                if attendee.lower() in meeting_title.lower():
-                    return note
-
-            # Fuzzy match title
-            note_desc = f"{note.get('company', '')} {note.get('topic', '')} {' '.join(note.get('attendees', []))}"
-            ratio = fuzz.token_sort_ratio(meeting_title.lower(), note_desc.lower())
-            if ratio >= threshold:
-                return note
-
-    return None
+    return index
 
 
 def get_notes_for_meetings(
@@ -248,7 +130,7 @@ def get_notes_for_meetings(
     deals: dict[str, str],
 ) -> dict[str, dict]:
     """
-    Match meetings with their notes from Google Drive.
+    Match meetings with their notes from the local Granola cache.
 
     Args:
         meetings: List of meeting dicts from google_calendar.fetch_meetings()
@@ -258,52 +140,99 @@ def get_notes_for_meetings(
         Dict mapping meeting event_id -> {meeting, note}
         Only includes meetings that have matching notes.
     """
-    print("    Scanning Google Drive for meeting notes...")
-    notes = scan_drive_notes()
-    print(f"    Found {len(notes)} recent notes")
+    settings = load_settings()
+    lookback_days = settings.get("lookback_days", 7)
 
-    if not notes:
+    print("    Reading local Granola cache...")
+    gr = GranolaReader()
+
+    # Build lookup indices
+    cal_index = _build_calendar_id_index(gr, lookback_days)
+    title_index = _build_title_index(gr, lookback_days)
+    print(f"    Found {len(cal_index)} recent Granola documents")
+
+    if not cal_index and not title_index:
         return {}
 
     matched = {}
+    matched_by_id = 0
+    matched_by_title = 0
 
     for meeting in meetings:
-        meeting_date = meeting["date"]
-        meeting_title = meeting["title"]
-        meeting_attendees = meeting.get("attendees", [])
+        event_id = meeting.get("event_id", "")
+        doc_id = None
 
-        # Try to get company name from deals config
-        company_name = ""
-        for domain in meeting.get("domains", []):
-            if domain in deals:
-                company_name = deals[domain]
-                break
+        # Primary: match by Google Calendar event ID
+        if event_id and event_id in cal_index:
+            doc_id = cal_index[event_id]
+            matched_by_id += 1
 
-        # Try to find matching note
-        note = match_meeting_to_note(
-            meeting_date=meeting_date,
-            meeting_title=meeting_title,
-            meeting_attendees=meeting_attendees,
-            company_name=company_name,
-            notes=notes,
-        )
+        # Fallback: match by date + title
+        if not doc_id:
+            meeting_date = meeting.get("date", "")
+            meeting_title = meeting.get("title", "").strip().lower()
+            if meeting_date and meeting_title:
+                doc_id = title_index.get((meeting_date, meeting_title))
+                if doc_id:
+                    matched_by_title += 1
 
-        if note:
-            matched[meeting["event_id"]] = {
-                "meeting": meeting,
-                "note": note,
-            }
+        if doc_id:
+            content = _build_note_content(gr, doc_id)
+            if content.strip():
+                matched[event_id] = {
+                    "meeting": meeting,
+                    "note": {
+                        "content": content,
+                        "doc_id": doc_id,
+                    },
+                }
+
+    if matched_by_id or matched_by_title:
+        print(f"    Matched {len(matched)} meetings ({matched_by_id} by calendar ID, {matched_by_title} by title)")
 
     return matched
 
 
+def scan_local_notes(lookback_days: Optional[int] = None) -> dict[str, dict]:
+    """
+    Scan local Granola cache for recent meeting notes.
+    Replacement for the old scan_drive_notes() that hit Google Drive.
+
+    Returns dict mapping doc_id -> {
+        date: YYYY-MM-DD,
+        title: meeting title,
+        attendees: list of {name, email},
+        content: note content (panels + user notes),
+    }
+    """
+    settings = load_settings()
+    lookback_days = lookback_days or settings.get("lookback_days", 7)
+
+    gr = GranolaReader()
+    meetings = gr.get_meetings(days=lookback_days)
+
+    notes = {}
+    for meeting in meetings:
+        doc_id = meeting["id"]
+        content = _build_note_content(gr, doc_id)
+        if content.strip():
+            notes[doc_id] = {
+                "date": meeting["date"],
+                "title": meeting["title"],
+                "attendees": meeting["attendees"],
+                "content": content,
+            }
+
+    return notes
+
+
 if __name__ == "__main__":
-    # Test the module
-    print("Scanning Google Drive for meeting notes...")
-    notes = scan_drive_notes(lookback_days=30)
-    print(f"Found {len(notes)} notes")
-    for key, note in list(notes.items())[:10]:
+    print("Scanning local Granola cache for meeting notes...")
+    notes = scan_local_notes(lookback_days=14)
+    print(f"Found {len(notes)} notes with content")
+    for doc_id, note in list(notes.items())[:10]:
         print(f"\n  Date: {note['date']}")
-        print(f"  Attendees: {', '.join(note['attendees'])}")
-        print(f"  Company: {note['company']}")
+        print(f"  Title: {note['title']}")
+        attendee_names = [a.get("name") or a.get("email", "") for a in note["attendees"]]
+        print(f"  Attendees: {', '.join(attendee_names[:5])}")
         print(f"  Content preview: {note['content'][:200]}...")
