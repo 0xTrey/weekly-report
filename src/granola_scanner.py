@@ -51,7 +51,13 @@ def _build_note_content(gr: GranolaReader, doc_id: str) -> str:
         parts.append("## Meeting Notes")
         parts.append(user_notes)
 
-    return "\n\n".join(parts)
+    content = "\n\n".join(parts)
+
+    # Cap at 4000 chars to trim outlier-length panels
+    if len(content) > 4000:
+        content = content[:4000]
+
+    return content
 
 
 def _build_calendar_id_index(gr: GranolaReader, lookback_days: int) -> dict[str, str]:

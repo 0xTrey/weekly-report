@@ -41,6 +41,36 @@ def get_user_email(service) -> str:
     return profile.get("emailAddress", "")
 
 
+def _clean_body_text(text: str) -> str:
+    """
+    Strip email noise: quoted replies, signatures, legal disclaimers.
+    Collapses blank lines and caps at 2000 chars.
+    """
+    lines = text.split("\n")
+    cleaned = []
+
+    for line in lines:
+        # Stop at signature/disclaimer delimiters
+        stripped = line.strip()
+        if stripped in ("-- ", "--") or stripped.startswith(("Sent from my", "CONFIDENTIAL", "This email and any")):
+            break
+        # Skip quoted reply lines
+        if stripped.startswith(">"):
+            continue
+        cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+
+    # Collapse runs of 3+ blank lines to 2
+    result = re.sub(r"\n{3,}", "\n\n", result)
+
+    # Cap at 2000 chars
+    if len(result) > 2000:
+        result = result[:2000]
+
+    return result
+
+
 def extract_body_text(payload: dict) -> str:
     """
     Extract plain text body from email payload.
@@ -74,8 +104,8 @@ def extract_body_text(payload: dict) -> str:
     # Clean up the text
     body_text = body_text.strip()
 
-    # Remove excessive whitespace
-    body_text = re.sub(r"\n{3,}", "\n\n", body_text)
+    # Strip email noise (signatures, quoted replies, disclaimers)
+    body_text = _clean_body_text(body_text)
 
     return body_text
 
@@ -191,7 +221,20 @@ def format_thread_for_llm(thread: dict) -> str:
     """
     lines = [f"Subject: {thread['subject']}", ""]
 
-    for msg in thread["messages"]:
+    messages = thread["messages"]
+
+    # For long threads, keep first + last 2 messages
+    if len(messages) > 4:
+        kept = [messages[0]] + messages[-2:]
+        omitted = len(messages) - 3
+    else:
+        kept = messages
+        omitted = 0
+
+    for i, msg in enumerate(kept):
+        if omitted and i == 1:
+            lines.append(f"[... {omitted} earlier messages omitted ...]")
+            lines.append("")
         label = "YOU wrote:" if msg["is_you"] else "THEY wrote:"
         lines.append(f"--- {label} ({msg['timestamp']}) ---")
         lines.append(msg["body"])
@@ -208,6 +251,10 @@ def get_domain_emails(domain: str, lookback_days: Optional[int] = None) -> str:
 
     if not threads:
         return ""
+
+    # Keep only the 3 most recent threads by latest message timestamp
+    threads.sort(key=lambda t: max((m["timestamp"] for m in t["messages"]), default=""), reverse=True)
+    threads = threads[:3]
 
     formatted_threads = []
     for thread in threads:

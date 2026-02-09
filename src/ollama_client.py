@@ -117,11 +117,20 @@ def synthesize(
     gateway = _get_gateway(model)
     prompt = f"Entity: {entity_name} ({entity_type})\n\n{SYNTHESIS_PROMPT.format(context=context)}"
 
+    # Scale output tokens based on input size
+    input_len = len(context)
+    if input_len < 2000:
+        max_tokens = 512
+    elif input_len <= 8000:
+        max_tokens = 1024
+    else:
+        max_tokens = 2048
+
     try:
         return gateway.chat(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=2048,
+            max_tokens=max_tokens,
         )
     except Exception as e:
         return f"Error: LLM request failed - {e}"
